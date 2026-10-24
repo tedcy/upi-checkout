@@ -45,7 +45,7 @@ STATE_DIR = ROOT / "cs_state"
 # và trang tự attach vào cái mới nhất -> mở lên thấy bảng trống).
 _LOG_DIR_ENV = os.environ.get("UPI_WEB_LOG_DIR", "").strip()
 LOG_DIR = Path(_LOG_DIR_ENV) if _LOG_DIR_ENV else ROOT / "logs"
-MAX_JOBS = 20
+MAX_JOBS = 4
 # Snapshot của job 5.000 acc là 11–24 MB; ghi lại mỗi 2 giây = write amplification rất lớn trên
 # btrfs (và từng góp phần làm FS hết metadata). 10 giây vẫn đủ mịn cho UI, mất tối đa 10 giây
 # tiến độ nếu process chết.
@@ -56,7 +56,7 @@ MAX_LOGS_PER_TASK = 200
 # snapshot/results.json phình ~4 KB mỗi task -> đặt UPI_MAX_BATCH=<n> nếu muốn chặn.
 MAX_TOKENS_PER_BATCH = int(os.environ.get("UPI_MAX_BATCH") or 0)
 MAX_WORKERS = 300
-SUBSCRIBER_QUEUE = 5000
+SUBSCRIBER_QUEUE = 1500
 
 # trang thai coi la thanh cong.
 # CHỈ "LINK" — tức đã trích xuất được link QR (`payments.stripe.com/upi/instructions/`).
@@ -271,6 +271,7 @@ class Job:
         self.stop_requested = False
         self.started_at = _now()
         self.finished_at: str | None = None
+        self.finished_at_ts: float = 0.0   # để dọn job cũ khỏi RAM theo TTL
         self.duration_ms: int | None = None
         self._t0 = time.time()
         self._lock = threading.RLock()
@@ -1204,6 +1205,47 @@ def get_saved_snapshot(job_id: str, *, backfill: bool = True) -> dict | None:
     return data
 
 
+# Job đã xong vẫn giữ toàn bộ Task (steps + logs + egress) trong RAM để xem lại/retry. Đo thật:
+# một job 6.262 task chiếm ~44 MB -> 20 job là ~900 MB. Snapshot đã có trên đĩa
+# (`logs/web_<job>_results.json`) nên chỉ cần giữ vài job gần nhất.
+FINISHED_JOB_TTL = 1800.0    # 30 phút sau khi job xong thì đuổi khỏi RAM (vẫn còn snapshot trên đĩa)
+
+
+def _evict_finished_jobs(force: bool = False) -> int:
+    """Bỏ job đã xong khỏi RAM (giữ tối đa MAX_JOBS) — trả về số job đã bỏ.
+
+    Không bao giờ đuổi job đang chạy. `force=True` chỉ giữ 1 job xong gần nhất.
+    """
+    dropped = 0
+    now = time.time()
+    with _JOBS_LOCK:
+        finished = [jid for jid in _JOB_ORDER
+                    if (_JOBS.get(jid) is not None and _JOBS[jid].status != "running")]
+        keep_limit = 1 if force else max(0, MAX_JOBS - sum(
+            1 for jid in _JOB_ORDER if _JOBS.get(jid) is not None and _JOBS[jid].status == "running"))
+        # Job xong quá TTL -> bỏ; sau đó vẫn cắt bớt nếu còn quá keep_limit.
+        for jid in list(finished):
+            job = _JOBS.get(jid)
+            if job is None:
+                continue
+            age = now - float(job.finished_at_ts or now)
+            over_ttl = age > FINISHED_JOB_TTL
+            over_cap = len([j for j in _JOB_ORDER
+                            if _JOBS.get(j) is not None and _JOBS[j].status != "running"]) > keep_limit
+            if over_ttl or over_cap:
+                _JOBS.pop(jid, None)
+                try:
+                    _JOB_ORDER.remove(jid)
+                except ValueError:
+                    pass
+                try:
+                    job.close_log()
+                except Exception:  # noqa: BLE001
+                    pass
+                dropped += 1
+    return dropped
+
+
 HEADLINE_SUFFIX = "_headline.json"
 HEADLINE_KEYS = ("job_id", "status", "total", "done", "ok", "fail", "skipped", "started_at")
 # Snapshot lớn nhất đo được 24 MB; `/api/jobs` cũ parse tới 20 file như vậy MỖI lần gọi
@@ -1240,6 +1282,8 @@ def _read_headline(path: Path) -> dict | None:
 
 
 def list_jobs() -> list[dict]:
+    _evict_finished_jobs()
+
     out = []
     seen = set()
     with _JOBS_LOCK:
@@ -2422,7 +2466,12 @@ def _complete_job(job: Job) -> None:
     _cleanup_job_files(job)
     job.duration_ms = int((time.time() - job._t0) * 1000)
     job.finished_at = _now()
+    job.finished_at_ts = time.time()
     job.status = "stopped" if job.stop_requested else "done"
+    # Job xong: log của từng task chỉ còn dùng cho failReason -> giữ đuôi ngắn, trả RAM.
+    for t in job.tasks.values():
+        if len(t.logs) > 20:
+            t.logs = t.logs[-20:]
     job.emit({"type": "job_done", "job_id": job.job_id, "ok": job.ok,
               "fail": job.fail, "done": job.done, "total": job.total,
               "status": job.status, "duration_ms": job.duration_ms,
@@ -2524,6 +2573,7 @@ def start_job(tokens: list[str], mode: str, country: str, promo: str, workers: i
               filter_proxies, stripe_telemetry, dump_traffic, prefilter)
     job._proxy_file, job._proxies = proxy_file, px
 
+    _evict_finished_jobs()
     with _JOBS_LOCK:
         _JOBS[job_id] = job
         _JOB_ORDER.append(job_id)

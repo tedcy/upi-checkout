@@ -769,5 +769,59 @@ class CheckpointThreadTests(unittest.TestCase):
             job.close_log()
 
 
+class JobEvictionTests(unittest.TestCase):
+    """Job đã xong phải bị đuổi khỏi RAM (mỗi job 6.000 task ~44 MB).
+
+    Đo thật 24-25/10: desk chạy 13 h, peak 8 GB RAM + 6,6 GB swap. Một phần vì `_JOBS` giữ
+    tới MAX_JOBS=20 job đã xong, mỗi job còn nguyên steps/logs/egress của hàng nghìn task.
+    """
+
+    def setUp(self):
+        self._saved_jobs = dict(engine._JOBS)
+        self._saved_order = list(engine._JOB_ORDER)
+        engine._JOBS.clear()
+        engine._JOB_ORDER.clear()
+
+    def tearDown(self):
+        engine._JOBS.clear()
+        engine._JOB_ORDER.clear()
+        engine._JOBS.update(self._saved_jobs)
+        engine._JOB_ORDER[:] = self._saved_order
+
+    def _make_job(self, jid: str, status: str, age: float = 0.0):
+        job = engine.Job(jid, "cs", ["tok"], "IN", "off", 1, "test", 1)
+        job.status = status
+        job.finished_at_ts = time.time() - age
+        engine._JOBS[jid] = job
+        engine._JOB_ORDER.append(jid)
+        return job
+
+    def test_old_finished_jobs_are_evicted(self):
+        self._make_job("old0001", "done", age=engine.FINISHED_JOB_TTL + 10)
+        self._make_job("old0002", "done", age=engine.FINISHED_JOB_TTL + 5)
+        dropped = engine._evict_finished_jobs()
+        self.assertEqual(dropped, 2)
+        self.assertEqual(engine._JOB_ORDER, [])
+
+    def test_running_jobs_are_never_evicted(self):
+        self._make_job("run001", "running")
+        for i in range(engine.MAX_JOBS + 2):
+            self._make_job(f"done{i:02d}", "done", age=1)
+        engine._evict_finished_jobs()
+        self.assertIn("run001", engine._JOBS)
+
+    def test_finished_cap_keeps_only_a_few(self):
+        for i in range(engine.MAX_JOBS + 3):
+            self._make_job(f"fin{i:02d}", "done", age=1)
+        engine._evict_finished_jobs()
+        self.assertLessEqual(len(engine._JOBS), engine.MAX_JOBS)
+
+    def test_force_keeps_single_finished_job(self):
+        for i in range(4):
+            self._make_job(f"f{i}", "done", age=1)
+        engine._evict_finished_jobs(force=True)
+        self.assertEqual(len(engine._JOBS), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

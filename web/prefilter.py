@@ -315,6 +315,7 @@ def start(tokens: Iterable[str], proxy_pool: list[str] | None = None, workers: i
     """Chạy prefilter nền; trả về id để poll `status(id)`."""
     tokens = [t.strip() for t in tokens if t and t.strip()]
     proxy_pool = proxy_pool or []
+    prune_stale()          # dọn kết quả các lần check cũ (giữ RAM có hạn)
     run = _Run(len(tokens), promo_id)
     with _RUNS_LOCK:
         _RUNS[run.id] = run

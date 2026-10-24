@@ -1684,6 +1684,32 @@ def load_proxy_seeds() -> list[str]:
     return proxy_seeds
 
 
+# --- Vòng đời session -------------------------------------------------------
+# Mỗi task tạo 5-7 session (provider, checkout, promo, tax, snapshot, approve…).
+# Trước đây KHÔNG session nào được close: với 300 worker và hàng nghìn task, mỗi session còn giữ
+# TLS buffer + connection pool + handle của curl_cffi -> RSS phình lên tới hàng GB.
+_SESSIONS = local()
+
+
+def _session_registry() -> list[Any]:
+    reg = getattr(_SESSIONS, "items", None)
+    if reg is None:
+        reg = []
+        _SESSIONS.items = reg
+    return reg
+
+
+def close_sessions() -> None:
+    """Đóng MỌI session đã tạo trong thread hiện tại (gọi ở finally của mỗi task)."""
+    reg = _session_registry()
+    while reg:
+        session = reg.pop()
+        try:
+            session.close()
+        except Exception:  # noqa: BLE001 — session hỏng/đã đóng
+            pass
+
+
 def _guard_session_stop(session: Any) -> Any:
     """Cho session biết lệnh Stop: kiểm tra trước MỖI request.
 
@@ -1731,6 +1757,7 @@ def new_session(proxy: str = "", use_pre_proxy: bool = True) -> Any:
         session.trust_env = False
     if proxy:
         set_proxy(session, proxy)
+    _session_registry().append(session)
     return _guard_session_stop(session)
 
 

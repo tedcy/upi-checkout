@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import queue
 import re
 import threading
@@ -182,6 +183,33 @@ def api_run(req: RunRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"job_id": job.job_id, "total": job.total}
+
+
+@app.get("/api/health")
+def api_health() -> dict:
+    """Số đo bộ nhớ/thread của desk — để phát hiện rò rỉ RAM sớm thay vì thấy máy chậm.
+
+    `rss_mb` là bộ nhớ thực tế; `jobs_in_ram` là số job còn giữ trong RAM (đã xong thì bị đuổi
+    theo TTL); `sessions` không đếm được toàn cục nên bỏ, nhưng `threads` phản ánh 1 thread/task.
+    """
+    rss_kb = threads = 0
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                elif line.startswith("Threads:"):
+                    threads = int(line.split()[1])
+    except OSError:
+        pass
+    running = sum(1 for j in engine._JOBS.values() if j.status == "running")
+    return {
+        "rss_mb": round(rss_kb / 1024, 1),
+        "threads": threads,
+        "jobs_in_ram": len(engine._JOBS),
+        "running_jobs": running,
+        "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX", ""),
+    }
 
 
 @app.get("/api/jobs")

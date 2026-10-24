@@ -433,6 +433,37 @@ Token **không** nằm trong snapshot/`results.json` (1 JWT ~2 KB × 6.000 task 
 và token sẽ nằm lại trên đĩa), nên job đã bị desk restart thì endpoint trả 404 kèm lý do
 (“token không lưu ra đĩa”) — UI hiện toast lỗi đúng câu đó.
 
+## Rò rỉ RAM: nguyên nhân và cách sửa (25/10)
+
+Hiện tượng: systemd báo desk chạy 13 h **peak 8 GB RAM + 6,6 GB swap** (`systemctl --user show
+upi-checkout.service -p MemoryPeak`). Truy ra 4 nguyên nhân, đều đã sửa:
+
+1. **Session HTTP không bao giờ đóng** (lớn nhất). Mỗi task tạo 5–7 session (`provider`,
+   `checkout`, `promo`, `tax`, `snapshot`, `approve`) qua `new_session()`; không chỗ nào gọi
+   `close()`, nên mỗi session còn giữ TLS buffer + connection pool + handle curl_cffi.
+   → `extract_cs` có registry thread-local; `cs_backend.run_in_process` gọi
+   `extract_cs.close_sessions()` trong `finally` của từng task.
+2. **Giữ quá nhiều job trong RAM.** `MAX_JOBS` = 20 và job xong không bị đuổi; đo thật một job
+   6.262 task chiếm **~44 MB** (steps + logs + egress) → 20 job ≈ 900 MB.
+   → `MAX_JOBS` = 4, `FINISHED_JOB_TTL` = 30 phút, job xong cắt `task.logs` còn 20 dòng.
+3. **glibc arena phình theo số thread.** 300 worker + thread con cho mỗi task khiến RSS không
+   trả lại OS (điển hình với Python đa luồng).
+   → unit systemd thêm `MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_=131072`,
+   `MALLOC_MMAP_THRESHOLD_=131072`.
+4. **Bộ nhớ phụ không dọn**: kết quả prefilter (`_RUNS`) không bao giờ prune; hàng đợi SSE mỗi
+   subscriber 5.000 event.
+   → `prefilter.start()` gọi `prune_stale()`, `SUBSCRIBER_QUEUE` = 1.500.
+
+**Đo lại sau khi sửa** (`GET /api/health` trả `rss_mb`, `threads`, `jobs_in_ram`):
+| thời điểm | RSS | threads |
+|---|---|---|
+| idle (sau restart) | 88 MB | 8 |
+| đang chạy 120 task / 30 worker | 322 MB (peak) | 38 |
+| chạy xong | ~189 MB (heap high-water, giữ lại) | 8 |
+
+Dùng `curl -s 127.0.0.1:8099/api/health` để theo dõi; nếu `rss_mb` tăng đơn điệu qua nhiều job
+thì báo lại để soi tiếp (dump `tracemalloc`).
+
 ## Toast bị kẹt dưới đáy màn hình — đã sửa
 
 Triệu chứng: toast hiện ở đáy *document* (chỉ thấy 1 dòng bị cắt) thay vì góc phải dưới viewport.

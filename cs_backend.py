@@ -231,6 +231,12 @@ def run_in_process(
             result.exit_code = 1
         finally:
             writer.flush()
+            # Đóng mọi HTTP session của task này (nếu không, mỗi task để lại 5-7 session
+            # với TLS buffer/connection pool -> RSS tăng dần theo số task đã chạy).
+            try:
+                extract_cs.close_sessions()
+            except Exception:  # noqa: BLE001
+                pass
 
     # Mỗi task CS chạy trên một worker thread riêng; state của từng task nằm trong
     # execution_context (thread-local) nên không cần khoá toàn cục nữa.
